@@ -9,3 +9,4 @@ services:
     working_dir: /etc/asterisk
     volumes:
       - ./etc/asterisk:/etc/asterisk
+      - ./recording:/var/spool/asterisk/recording
