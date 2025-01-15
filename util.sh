@@ -1,15 +1,57 @@
 #!/bin/env bash
 
-#set -x
+# Usage:
+#    bridge: ./util.sh -c clearChannels,clearBridges,createAndBridgeChannels
 
-base_url="http://192.168.6.5:8088/ari"
+# normalize command line arguments
+TEMP=$(getopt -o c:k:h -l command:,key:,help,ip: -n '$0' -- "$@")
+
+if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
+
+# 重新设置命令行参数
+eval set -- "$TEMP"
+# ref to https://stackoverflow.com/questions/402377/using-getopts-to-process-long-and-short-command-line-options
+# If you delete above lines (everything up through the eval set line), the code will still work!
+# However, your code will be much pickier in what sorts of options it accepts.
+# In particular, you'll have to specify all options in the "canonical" form described above.
+# With the use of getopt, however, you can group single-letter options, use shorter non-ambiguous forms of long-options.
+# getopt also outputs an error message if unrecognized or ambiguous options are found.
+
+default_ip=192.168.70.128
 api_key="asterisk:passwd"
+
+function show_help() {
+    echo "Usage: $0 -c commands [-k <key>] [-ip <ip>] [-h]"
+    echo "  -c <commands>    commands to be executed"
+    echo "  -ip <ip>         IP address of the server (default: $default_ip)"
+    echo "  -h               Show this help message"
+}
+
+# set -x
+while true; do
+    case "$1" in
+        -c | --command ) commands="$2"; shift 2 ;;
+        -k | --key ) api_key="$2"; shift 2 ;;
+        -h | --help ) show_help; exit 0 ;;
+        --ip ) default_ip="$2"; shift 2 ;;
+        * ) break ;;
+    esac
+done
+
+base_url="http://$default_ip:8088/ari"
 bridge_id=123
 channel1_id=123
 channel2_id=456
+user1=0000f30A0A01
+user2=0000f30B0B02
+
+if [ -z "$commands" ]; then
+    show_help
+    exit 1
+fi
 
 # clear all channels
-clearChannels() {
+function clearChannels() {
     local channels_response
     channels_response=$(curl -s -G "$base_url/channels" --data-urlencode "api_key=$api_key")
 
@@ -38,7 +80,7 @@ clearChannels() {
     done
 }
 
-clearBridges() {
+function clearBridges() {
     local bridges_response
     bridges_response=$(curl -s -G "$base_url/bridges" --data-urlencode "api_key=$api_key")
 
@@ -68,9 +110,9 @@ clearBridges() {
     return 0
 }
 
-createAndBridgeChannels() {
+function createAndBridgeChannels() {
     local channel1_response
-    channel1_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F6001&app=test&timeout=30&channelId=$channel1_id&api_key=$api_key")
+    channel1_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F$user1&app=test&timeout=30&channelId=$channel1_id&api_key=$api_key")
 
     if [[ $? -ne 0 ]]; then
         echo "Failed to create channel 1"
@@ -78,7 +120,7 @@ createAndBridgeChannels() {
     fi
 
     local channel2_response
-    channel2_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F6002&app=test&timeout=30&channelId=$channel2_id&api_key=$api_key")
+    channel2_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F$user2&app=test&timeout=30&channelId=$channel2_id&api_key=$api_key")
 
     if [[ $? -ne 0 ]]; then
         echo "Failed to create channel 2"
@@ -126,8 +168,43 @@ createAndBridgeChannels() {
     echo "Successfully created and bridged channels, bridgeId($bridge_id)"
 }
 
-clearChannels
-clearBridges
-createAndBridgeChannels
+# connect to websocket
+function connect() {
+    wscat -c "ws://$default_ip:8088/ari/events?api_key=$api_key&app=test"
+}
+
+# record and generate recording file
+function record() {
+    local fn=$(date +"%Y-%m-%d %H:%M:%S")
+    local record_response=$(curl -s -G -X POST "$base_url/bridges/$bridge_id/record?format=wav&ifExists=overwrite&terminateOn=none&api_key=$api_key" --data-urlencode "name=$fn")
+
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to record in bridge($bridge_id)"
+        return 1
+    fi
+
+    echo "Successfully start record in bridge($bridge_id)"
+}
+
+# play a sound
+function play() {
+    local sound=hello-world
+    local play_response=$(curl -s -X POST "$base_url/bridges/$bridge_id/play?skipms=3000&api_key=$api_key" --data-urlencode "media=sound:$sound")
+
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to play in bridge($bridge_id)"
+        return 1
+    fi
+
+    echo "Successfully play $sound in bridge($bridge_id)"
+}
+
+# parse and call functions
+IFS=',' read -ra cmds <<< "$commands"
+for command in "${cmds[@]}"; do
+    if declare -F "$command" > /dev/null; then
+        $command
+    fi
+done
 
 set +x
