@@ -14,3 +14,17 @@ services:
     #  - http_proxy=http://127.0.0.1:7890
     #  - https_proxy=http://127.0.0.1:7890
     #  - all_proxy=http://127.0.0.1:7890
+  asterisk2:
+    image: ast
+    container_name: asterisk2
+    network_mode: host
+    command: sleep infinity
+    #command: asterisk -cvvvvv
+    working_dir: /etc/asterisk
+    volumes:
+      - ./etc/asterisk2:/etc/asterisk
+      - ./recording:/var/spool/asterisk/recording
+    environment:
+      - http_proxy=http://127.0.0.1:7890
+      - https_proxy=http://127.0.0.1:7890
+      - all_proxy=http://127.0.0.1:7890
