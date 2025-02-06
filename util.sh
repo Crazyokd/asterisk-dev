@@ -1,7 +1,8 @@
 #!/bin/env bash
 
 # Usage:
-#    bridge: ./util.sh -c clearChannels,clearBridges,createAndBridgeChannels
+#    bridge: ./util.sh -c clearChannels,clearBridges,createAndBridgeChannels --ip 172.16.16.20
+#    websockt: ./util.sh -c connect --ip 172.16.16.20
 
 # normalize command line arguments
 TEMP=$(getopt -o c:k:h -l command:,key:,help,ip: -n '$0' -- "$@")
@@ -19,11 +20,12 @@ eval set -- "$TEMP"
 
 default_ip=192.168.70.128
 api_key="asterisk:passwd"
+app=test
 
 function show_help() {
     echo "Usage: $0 -c commands [-k <key>] [-ip <ip>] [-h]"
     echo "  -c <commands>    commands to be executed"
-    echo "  -ip <ip>         IP address of the server (default: $default_ip)"
+    echo "  --ip <ip>         IP address of the server (default: $default_ip)"
     echo "  -h               Show this help message"
 }
 
@@ -110,57 +112,152 @@ function clearBridges() {
     return 0
 }
 
-function createAndBridgeChannels() {
-    local channel1_response
-    channel1_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F$user1&app=test&timeout=30&channelId=$channel1_id&api_key=$api_key")
+# record and generate recording file
+# $1: bridgeId
+function record() {
+    local fn=$(date +"%Y-%m-%d")
+    local record_response=$(curl -s -G -X POST "$base_url/bridges/$1/record?format=wav&ifExists=overwrite&terminateOn=none&api_key=$api_key" --data-urlencode "name=$fn")
 
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to record in bridge($1)"
+        return 1
+    fi
+
+    echo "Successfully start record in bridge($1)"
+}
+
+# $1: channelId, $2: bridgeId
+function add_channel_to_bridge() {
+    local max_retry=25
+    local retry=0
+    while true; do
+        local channel_status_response
+        channel_status_response=$(curl -s -G "$base_url/channels/$1" --data-urlencode "api_key=$api_key")
+        local state=$(echo "$channel_status_response" | jq -r '.state')
+        if [[ "$state" == "Up" ]]; then
+            break
+        fi
+        retry=$((retry+1))
+        if [ $retry -eq $max_retry ]; then
+            return 2
+        fi
+        sleep 1
+    done
+    local add_channel_response
+    add_channel_response=$(curl -s -X POST "$base_url/bridges/$2/addChannel?channel=$1&api_key=$api_key")
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to add channel $1 to bridge"
+        return 1
+    fi
+    echo "Successfully add $1 to bridge"
+}
+
+function createBridge() {
+    local bridge_response
+    bridge_response=$(curl -s -X POST "$base_url/bridges/$1?api_key=$api_key")
+
+    return $?
+}
+
+function answerChannel() {
+    $(curl -s -X POST "$base_url/channels/$1/answer?api_key=$api_key")
+    return $?
+}
+
+# play a sound
+# $1: bridgeId
+function play() {
+    local sound=busy-hangovers
+    local play_response=$(curl -s -X POST "$base_url/bridges/$1/play?skipms=3000&api_key=$api_key" --data-urlencode "media=sound:$sound")
+
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to play in bridge($1)"
+        return 1
+    fi
+
+    echo "Successfully play $sound in bridge($1)"
+}
+
+# $1: user, $2: channelId
+function createChannel() {
+    local channel_response
+    channel_response=$(curl -s -X POST "$base_url/channels?endpoint=SIP%2F$1%40WCDMA1&app=$app&timeout=30&channelId=$2&api_key=$api_key")
+
+    return $?
+}
+
+function bridgeCalled() {
+    local channel1=1738821091.65 # channel.caller.number
+    local channel2=888 # channel.dialplan.exten
+    local callee=18601234514
+
+    # 删除channel2
+    curl -s -X DELETE "$base_url/channels/$channel2" --data-urlencode "api_key=$api_key"
+    # 获取channelId（这里只是简单的获取第一个channel的Id）
+    channels_response=$(curl -s -G "$base_url/channels" --data-urlencode "api_key=$api_key")
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to retrieve channels list"
+        return 1
+    fi
+    channel1=$(echo "$channels_response" | jq -r '.[0].id')
+
+    createChannel $callee $channel2
     if [[ $? -ne 0 ]]; then
         echo "Failed to create channel 1"
         return 1
     fi
 
-    local channel2_response
-    channel2_response=$(curl -s -X POST "$base_url/channels?endpoint=PJSIP%2F$user2&app=test&timeout=30&channelId=$channel2_id&api_key=$api_key")
+    # 创建bridge
+    createBridge $bridge_id
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to create bridge"
+        return 1
+    fi
+    # 将两个通道加入桥接
+    add_channel_to_bridge "$channel2" "$bridge_id"
+    if [[ $? -ne 0 ]]; then
+        echo "$callee is busy"
+        curl -s -X DELETE "$base_url/channels/$channel2" --data-urlencode "api_key=$api_key"
+        curl -s -X DELETE "$base_url/channels/$channel1" --data-urlencode "api_key=$api_key"
+        return 1
+    fi
+    answerChannel $channel1
+    add_channel_to_bridge "$channel1" "$bridge_id"
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    # 开始录音
+    record $bridge_id
+    # 播放一段示例语音
+    play $bridge_id
+}
 
+function createAndBridgeChannels() {
+    createChannel $user1 $channel1_id
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to create channel 1"
+        return 1
+    fi
+
+    createChannel $user2 $channel2_id
     if [[ $? -ne 0 ]]; then
         echo "Failed to create channel 2"
         return 1
     fi
 
     # 创建bridge
-    local bridge_response
-    bridge_response=$(curl -s -X POST "$base_url/bridges/$bridge_id?api_key=$api_key")
-
+    createBridge $bridge_id
     if [[ $? -ne 0 ]]; then
         echo "Failed to create bridge"
         return 1
     fi
 
-    add_channel_to_bridge() {
-        local channel_id=$1
-        while true; do
-            local channel_status_response
-            channel_status_response=$(curl -s -G "$base_url/channels/$channel_id" --data-urlencode "api_key=$api_key")
-            local state=$(echo "$channel_status_response" | jq -r '.state')
-            if [[ "$state" == "Up" ]]; then
-                break
-            fi
-            sleep 1
-        done
-        local add_channel_response
-        add_channel_response=$(curl -s -X POST "$base_url/bridges/$bridge_id/addChannel?channel=$channel_id&api_key=$api_key")
-        if [[ $? -ne 0 ]]; then
-            echo "Failed to add channel $channel_id to bridge"
-            return 1
-        fi
-        echo "Successfully add $channel_id to bridge"
-    }
     # 将两个通道加入桥接
-    add_channel_to_bridge "$channel1_id"
+    add_channel_to_bridge "$channel1_id" "$bridge_id"
     if [[ $? -ne 0 ]]; then
         return 1
     fi
-    add_channel_to_bridge "$channel2_id"
+    add_channel_to_bridge "$channel2_id" "$bridge_id"
     if [[ $? -ne 0 ]]; then
         return 1
     fi
@@ -170,33 +267,24 @@ function createAndBridgeChannels() {
 
 # connect to websocket
 function connect() {
-    wscat -c "ws://$default_ip:8088/ari/events?api_key=$api_key&app=test"
+    wscat -c "ws://$default_ip:8088/ari/events?api_key=$api_key&app=$app&subscribeAll=true"
 }
 
-# record and generate recording file
-function record() {
-    local fn=$(date +"%Y-%m-%d %H:%M:%S")
-    local record_response=$(curl -s -G -X POST "$base_url/bridges/$bridge_id/record?format=wav&ifExists=overwrite&terminateOn=none&api_key=$api_key" --data-urlencode "name=$fn")
-
+function filterEvent() {
+    local filterBody=$(jq -n '{
+        allowed: [
+            { type: "StasisStart" },
+            { type: "StasisEnd" }
+        ]
+    }')
+    echo $filterBody
+    local filter_response=$(curl -s -X PUT "$base_url/applications/$app/eventFilter?api_key=$api_key" -H "Content-Type: application/json" -d "$filterBody")
     if [[ $? -ne 0 ]]; then
-        echo "Failed to record in bridge($bridge_id)"
+        echo "Failed to filter events"
         return 1
     fi
 
-    echo "Successfully start record in bridge($bridge_id)"
-}
-
-# play a sound
-function play() {
-    local sound=hello-world
-    local play_response=$(curl -s -X POST "$base_url/bridges/$bridge_id/play?skipms=3000&api_key=$api_key" --data-urlencode "media=sound:$sound")
-
-    if [[ $? -ne 0 ]]; then
-        echo "Failed to play in bridge($bridge_id)"
-        return 1
-    fi
-
-    echo "Successfully play $sound in bridge($bridge_id)"
+    echo "Successfully filter events"
 }
 
 # parse and call functions
